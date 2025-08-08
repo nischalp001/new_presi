@@ -79,6 +79,11 @@
             margin-left: auto;
         }
 
+        .status-dot.listening {
+            background: #ff6b6b;
+            animation: pulse 1s infinite;
+        }
+
         @keyframes pulse {
             0% { opacity: 1; transform: scale(1); }
             50% { opacity: 0.6; transform: scale(1.1); }
@@ -264,6 +269,12 @@
             cursor: not-allowed;
         }
 
+        #homeBtn:hover {
+            background: rgba(255, 255, 255, 0.2);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+        }
+
         .welcome-message {
             text-align: center;
             color: rgba(255, 255, 255, 0.7);
@@ -299,6 +310,33 @@
             line-height: 1.5;
         }
 
+        .context-controls {
+            display: flex;
+            gap: 8px;
+            margin-left: auto;
+        }
+
+        .context-button {
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: white;
+            padding: 6px 12px;
+            border-radius: 16px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.3s ease;
+        }
+
+        .context-button:hover {
+            background: rgba(255, 255, 255, 0.2);
+            transform: translateY(-1px);
+        }
+
+        .context-button.active {
+            background: rgba(79, 172, 254, 0.3);
+            border-color: rgba(79, 172, 254, 0.5);
+        }
+
         @media (max-width: 768px) {
             .chat-container {
                 width: 100%;
@@ -308,6 +346,11 @@
             
             .message-content {
                 max-width: 85%;
+            }
+
+            .context-controls {
+                flex-direction: column;
+                gap: 4px;
             }
         }
     </style>
@@ -321,13 +364,18 @@
                 <p>Presidential Intelligence</p>
             </div>
             <div class="status-dot"></div>
+            <div class="context-controls">
+                <button id="contextToggle" class="context-button active">Context: ON</button>
+                <button id="clearContext" class="context-button">Clear History</button>
+                <button id="homeBtn" class="context-button">Talking Bot</button>
+            </div>
         </div>
 
         <div class="chat-messages" id="chatMessages">
             <div class="welcome-message">
                 <div class="welcome-icon">P</div>
                 <h2>Hii, I am Presi</h2>
-                <p>I'm here to help you with any questions about Presidential Graduate School. Start a conversation by typing a message below.</p>
+                <p>I'm here to help you with any questions about Presidential Graduate School. Start a conversation by typing a message below. I'll remember our conversation context!</p>
             </div>
         </div>
 
@@ -356,11 +404,196 @@
         </div>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/annyang@2.6.1/dist/annyang.min.js"></script>
     <script>
         const chatMessages = document.getElementById('chatMessages');
         const messageInput = document.getElementById('messageInput');
         const sendButton = document.getElementById('sendButton');
         const typingIndicator = document.getElementById('typingIndicator');
+        const contextToggle = document.getElementById('contextToggle');
+        const clearContextBtn = document.getElementById('clearContext');
+
+        // Conversation context management
+        let conversationHistory = [];
+        let useContext = true;
+        const maxHistoryLength = 20; // Limit history to prevent API payload from getting too large
+
+        // Speech Recognition Variables
+        let isListening = false;
+        let isTriggered = false;
+        let transcriptBuffer = '';
+        const silenceTimeout = 4000;
+        let silenceTimer = null;
+        let continuousRecognition = null;
+
+        // Context management functions
+        function toggleContext() {
+            useContext = !useContext;
+            contextToggle.textContent = `Context: ${useContext ? 'ON' : 'OFF'}`;
+            contextToggle.classList.toggle('active', useContext);
+            
+            if (!useContext) {
+                addSystemMessage('Context disabled. I will not remember previous messages.');
+            } else {
+                addSystemMessage('Context enabled. I will remember our conversation.');
+            }
+        }
+
+        function clearConversationHistory() {
+            conversationHistory = [];
+            addSystemMessage('Conversation history cleared. Starting fresh!');
+        }
+
+        function addToHistory(role, content) {
+            conversationHistory.push({ role, content, timestamp: Date.now() });
+            
+            // Keep only recent messages to prevent API payload from becoming too large
+            if (conversationHistory.length > maxHistoryLength) {
+                conversationHistory = conversationHistory.slice(-maxHistoryLength);
+            }
+        }
+
+        function addSystemMessage(content) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message bot';
+            messageDiv.style.opacity = '0.7';
+            
+            const avatar = document.createElement('div');
+            avatar.className = 'message-avatar';
+            avatar.innerHTML = '⚙️';
+            avatar.style.background = 'rgba(255, 255, 255, 0.2)';
+            
+            const messageContent = document.createElement('div');
+            messageContent.className = 'message-content';
+            messageContent.textContent = content;
+            messageContent.style.fontSize = '14px';
+            messageContent.style.fontStyle = 'italic';
+            
+            messageDiv.appendChild(avatar);
+            messageDiv.appendChild(messageContent);
+            
+            chatMessages.appendChild(messageDiv);
+            scrollToBottom();
+        }
+
+        // Initialize Speech Recognition with Web Speech API
+        function initializeSpeechRecognition() {
+            // Try Web Speech API first
+            if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+                const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+                continuousRecognition = new SpeechRecognition();
+                continuousRecognition.continuous = true;
+                continuousRecognition.interimResults = true;
+                continuousRecognition.lang = 'en-US';
+            } else if (typeof annyang !== 'undefined') {
+                // Fallback to annyang if Web Speech API not available
+                console.log('Using annyang for speech recognition');
+                initializeAnnyang();
+                return;
+            } else {
+                console.log('Speech recognition not supported in this browser');
+                return;
+            }
+
+            continuousRecognition.onresult = (event) => {
+                let finalTranscript = '', interimTranscript = '';
+                
+                for (let i = event.resultIndex; i < event.results.length; i++) {
+                    const transcript = event.results[i][0].transcript.toLowerCase().trim();
+                    if (event.results[i].isFinal) {
+                        finalTranscript += transcript;
+                    } else {
+                        interimTranscript += transcript;
+                    }
+                }
+
+                const current = (finalTranscript || interimTranscript).toLowerCase();
+                console.log('Speech detected:', current);
+
+                // Check for "hello" trigger word
+                if (!isTriggered && current.includes('hello')) {
+                    console.log('Trigger word "hello" detected:', current);
+                    isTriggered = true;
+                    transcriptBuffer = extractTextAfterTrigger(current);
+                    addMessage(`Voice detected: "${transcriptBuffer || 'Hello detected, listening for command...'}"`, 'bot');
+                    resetSilenceTimer();
+                } else if (isTriggered && finalTranscript) {
+                    if (transcriptBuffer) {
+                        transcriptBuffer += ' ' + finalTranscript;
+                    } else {
+                        transcriptBuffer = finalTranscript;
+                    }
+                    console.log('Adding to transcript buffer:', finalTranscript);
+                    resetSilenceTimer();
+                }
+            };
+
+            continuousRecognition.onstart = () => {
+                console.log('Speech recognition started');
+                isListening = true;
+                document.querySelector('.status-dot').classList.add('listening');
+            };
+
+            continuousRecognition.onend = () => {
+                console.log('Speech recognition ended');
+                isListening = false;
+                document.querySelector('.status-dot').classList.remove('listening');
+                
+                // Restart recognition if still supposed to be listening
+                if (isListening) {
+                    setTimeout(() => {
+                        try {
+                            continuousRecognition.start();
+                        } catch (error) {
+                            console.error('Error restarting recognition:', error);
+                        }
+                    }, 100);
+                }
+            };
+
+            continuousRecognition.onerror = (e) => {
+                console.error('Speech error:', e.error);
+                if (e.error === 'not-allowed') {
+                    alert('Microphone access denied. Please allow microphone access and try again.');
+                }
+            };
+        }
+
+        function checkForTriggerWords(text) {
+            return text.includes('hello');
+        }
+
+        function extractTextAfterTrigger(text) {
+            const index = text.indexOf('hello');
+            if (index !== -1) {
+                return text.substring(index + 5).trim(); // 5 is length of "hello"
+            }
+            return '';
+        }
+
+        function resetSilenceTimer() {
+            clearTimeout(silenceTimer);
+            silenceTimer = setTimeout(() => {
+                handleSilence();
+            }, silenceTimeout);
+        }
+
+        function handleSilence() {
+            if (isTriggered && transcriptBuffer.trim()) {
+                console.log('Processing voice command:', transcriptBuffer.trim());
+                sendMessage(transcriptBuffer.trim());
+                isTriggered = false;
+                transcriptBuffer = '';
+            } else if (isTriggered && !transcriptBuffer.trim()) {
+                console.log('Triggered but no command detected, resetting...');
+                isTriggered = false;
+                transcriptBuffer = '';
+            }
+        }
+
+        // Event listeners
+        contextToggle.addEventListener('click', toggleContext);
+        clearContextBtn.addEventListener('click', clearConversationHistory);
 
         // Auto-resize textarea
         messageInput.addEventListener('input', function() {
@@ -378,8 +611,13 @@
 
         sendButton.addEventListener('click', sendMessage);
 
-        function sendMessage() {
-            const message = messageInput.value.trim();
+        // Home button event listener
+        document.getElementById('homeBtn').addEventListener('click', () => {
+            window.location.href = 'index.html';
+        });
+
+        function sendMessage(voiceMessage = null) {
+            const message = voiceMessage || messageInput.value.trim();
             if (!message) return;
 
             // Hide welcome message if it exists
@@ -388,8 +626,12 @@
                 welcomeMessage.remove();
             }
 
-            // Add user message
+            // Add user message to chat and history
             addMessage(message, 'user');
+            if (useContext) {
+                addToHistory('user', message);
+            }
+            
             messageInput.value = '';
             messageInput.style.height = 'auto';
             
@@ -406,7 +648,7 @@
             
             const avatar = document.createElement('div');
             avatar.className = 'message-avatar';
-            avatar.innerHTML = sender === 'user' ? 'U' : 'N';
+            avatar.innerHTML = sender === 'user' ? 'U' : 'P';
             
             const messageContent = document.createElement('div');
             messageContent.className = 'message-content';
@@ -432,14 +674,26 @@
 
         async function fetchResponse(userMessage) {
             try {
+                // Prepare the payload
+                let payload = {
+                    query: userMessage
+                };
+
+                // Add conversation history if context is enabled
+                if (useContext && conversationHistory.length > 0) {
+                    payload.conversation_history = conversationHistory;
+                    // Or alternatively, you can format it as a single context string:
+                    // payload.context = conversationHistory.map(msg => `${msg.role}: ${msg.content}`).join('\n');
+                }
+
+                console.log('Sending payload:', payload);
+
                 const response = await fetch('https://pgs-llm.onrender.com/rag', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({
-                        query: userMessage
-                    })
+                    body: JSON.stringify(payload)
                 });
 
                 if (!response.ok) {
@@ -452,11 +706,21 @@
                 // Add bot response
                 const botResponse = data.response || data.answer || "I'm sorry, I couldn't process your request right now.";
                 addMessage(botResponse, 'bot');
+                
+                // Add bot response to history if context is enabled
+                if (useContext) {
+                    addToHistory('assistant', botResponse);
+                }
 
             } catch (error) {
                 console.error('Error fetching response:', error);
                 hideTypingIndicator();
-                addMessage("I'm experiencing some technical difficulties. Please try again later.", 'bot');
+                const errorMessage = "I'm experiencing some technical difficulties. Please try again later.";
+                addMessage(errorMessage, 'bot');
+                
+                if (useContext) {
+                    addToHistory('assistant', errorMessage);
+                }
             }
         }
 
@@ -464,9 +728,20 @@
             chatMessages.scrollTop = chatMessages.scrollHeight;
         }
 
-        // Focus input on load
+        // Focus input on load and initialize speech recognition
         window.addEventListener('load', () => {
             messageInput.focus();
+            initializeSpeechRecognition();
+            
+            // Start listening for voice commands
+            if (continuousRecognition) {
+                try {
+                    continuousRecognition.start();
+                    console.log('Started listening for voice commands...');
+                } catch (error) {
+                    console.error('Error starting speech recognition:', error);
+                }
+            }
         });
     </script>
 </body>
